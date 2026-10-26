@@ -1,0 +1,19 @@
+# Fichiers locaux et secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+/bin/
+/dist/
+/saves/
+*.exe
+*.test
+*.out

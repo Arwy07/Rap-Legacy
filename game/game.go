@@ -1,0 +1,1218 @@
+package game
+
+import (
+	"bytes"
+	"fmt"
+	"image"
+	"image/color"
+	"log"
+	"os"
+	"time"
+
+	"github.com/hajimehoshi/ebiten/v2"
+	"github.com/hajimehoshi/ebiten/v2/audio"
+	"github.com/hajimehoshi/ebiten/v2/audio/mp3"
+	"github.com/hajimehoshi/ebiten/v2/ebitenutil"
+	"github.com/hajimehoshi/ebiten/v2/inpututil"
+	"github.com/hajimehoshi/ebiten/v2/text"
+	"golang.org/x/image/font"
+	"golang.org/x/image/font/basicfont"
+	"golang.org/x/image/font/opentype"
+)
+
+// -----------------
+// Button structure
+// -----------------
+type Button struct {
+	Rect   image.Rectangle
+	Label  string
+	Action func()
+}
+
+// -----------------
+// GameState
+// -----------------
+type GameState int
+
+const (
+	StateIntro GameState = iota
+	StateMenu
+	StateSettings
+	StateSaveSelect
+	StateCreateSave
+	StatePlaying
+	StateMerchantMenu
+	StateBlacksmithMenu
+)
+
+// -----------------
+// Merchant Items
+// -----------------
+type MerchantItem struct {
+	Name   string
+	Price  int
+	Action func(g *Game)
+}
+
+// Liste des articles vendus par le marchand
+var MerchantItems = []MerchantItem{
+	{
+		Name:  "Cristalline",
+		Price: 50,
+		Action: func(g *Game) {
+			if g.player != nil {
+				switch g.player.class {
+				case "Lyricistes":
+					g.Inventaire.AddItem("Cristalline - mystérieuse")
+				case "Performeurs":
+					g.Inventaire.AddItem("Cristalline - tonic")
+				case "Hitmakers":
+					g.Inventaire.AddItem("Cristalline - suspicieuse")
+				default:
+					g.Inventaire.AddItem("Cristalline")
+				}
+			}
+		},
+	},
+
+	{
+		Name:  "Followers",
+		Price: 200,
+		Action: func(g *Game) {
+			g.Followers += 100
+		},
+	},
+}
+
+// -----------------
+// Notification system
+// -----------------
+type Notification struct {
+	Text      string
+	ExpiresAt time.Time
+}
+
+var notifications []Notification
+
+func AddNotification(msg string) {
+	notifications = append(notifications, Notification{
+		Text:      msg,
+		ExpiresAt: time.Now().Add(3 * time.Second), // 3 secondes
+	})
+}
+
+func UpdateNotifications() {
+	now := time.Now()
+	active := []Notification{}
+	for _, n := range notifications {
+		if n.ExpiresAt.After(now) {
+			active = append(active, n)
+		}
+	}
+	notifications = active
+}
+
+func DrawNotifications(screen *ebiten.Image, fontFace font.Face) {
+	screenW, _ := screen.Size() // largeur de l’écran
+
+	for i, n := range notifications {
+		// Mesurer la largeur du texte
+		bounds, _ := font.BoundString(fontFace, n.Text)
+		textWidth := (bounds.Max.X - bounds.Min.X).Ceil()
+
+		// Calculer X pour centrer
+		x := (screenW - textWidth) / 2
+
+		// Y : position de départ (40) + espacement (30)
+		y := 40 + i*30
+
+		// Dessiner le texte centré
+		text.Draw(screen, n.Text, fontFace, x, y, color.RGBA{255, 255, 0, 255})
+	}
+}
+
+// -----------------
+// Game structure
+// -----------------
+type Game struct {
+	state                GameState
+	menuButtons          []*Button
+	menuBg               *ebiten.Image
+	settingsBg           *ebiten.Image
+	background           *ebiten.Image
+	SelectSaveBackground *ebiten.Image
+	merchantBg           *ebiten.Image
+	menuforgeron         *ebiten.Image
+	audioContext         *audio.Context
+	bgmPlayer            *audio.Player
+	menuSelected         int
+	volume               int
+	moneyIcon            *ebiten.Image   // ✅ icône argent
+	followerIcon         *ebiten.Image   // ✅ icône followers
+	MerchantZone         image.Rectangle // Zone interaction marchand
+	showBlacksmithMenu   bool
+	blacksmithSelected   int
+
+	// Intro
+	introTimer int
+	introText  string
+
+	// Sauvegardes
+	saves         []Save
+	saveSelected  int
+	newSaveName   string
+	newSaveClass  string
+	cursorTimer   int
+	pendingDelete string // confirmation suppression
+
+	// Gameplay
+	player                *Player
+	mapData               *Map
+	enemies               []*Enemy
+	inBattle              bool
+	currentEnemy          *Enemy
+	battle                *Battle
+	Merchant              *Merchant
+	Money                 int
+	Followers             int
+	SelectedMerchantIndex int
+	PlayerClass           string
+	Winner                string // "player" ou "enemy"
+
+	// Zone de combat
+	combatZone image.Rectangle
+
+	// Inventaire
+	Inventaire *Inventaire
+
+	// Polices
+	fontSmall font.Face
+	fontBig   font.Face
+}
+
+// -----------------
+// LoadImage helper
+// -----------------
+func LoadImage(path string) *ebiten.Image {
+	img, _, err := ebitenutil.NewImageFromFile(path)
+	if err != nil {
+		log.Println("Erreur chargement image:", path, err)
+		return nil
+	}
+	return img
+}
+
+// -----------------
+// Helper : touche "just pressed"
+// -----------------
+var prevKeyState = make(map[ebiten.Key]bool)
+
+func IsKeyJustPressed(key ebiten.Key) bool {
+	pressed := ebiten.IsKeyPressed(key)
+	was := prevKeyState[key]
+	prevKeyState[key] = pressed
+	return pressed && !was
+}
+
+// -----------------
+// NewGame
+// -----------------
+func NewGame() *Game {
+	g := &Game{
+		state:      StateIntro, // commence par l'intro
+		volume:     50,
+		introText:  "Bienvenue dans Rap Legacy !",
+		introTimer: 0,
+	}
+	g.moneyIcon = LoadImage("assets/money.png")
+	g.followerIcon = LoadImage("assets/followers.png")
+
+	// Background menu
+	g.menuBg = LoadImage("assets/menu_bg.png")
+
+	// Background sélection sauvegarde
+	g.SelectSaveBackground = LoadImage("assets/SelectSaveBackground.png")
+
+	// Background marchand
+	g.merchantBg = LoadImage("assets/merchant_bg.png")
+
+	// Background paramètres
+	g.settingsBg = LoadImage("assets/image3.png")
+
+	// Background forgeron (menu forgeron)
+	g.menuforgeron = LoadImage("assets/menuforgeron.png")
+
+	// Boutons menu principal
+	g.menuButtons = []*Button{
+		{
+			Rect:   image.Rect(685, 490, 1160, 550),
+			Label:  "New Game",
+			Action: func() { g.openSaveSelect() },
+		},
+		{
+			Rect:   image.Rect(730, 600, 1110, 660),
+			Label:  "Options",
+			Action: func() { g.state = StateSettings },
+		},
+		{
+			Rect:   image.Rect(820, 700, 1010, 765),
+			Label:  "Quit",
+			Action: func() { os.Exit(0) },
+		},
+	}
+
+	// Charger la police externe
+	ttfBytes, err := os.ReadFile("assets/PressStart2P.ttf")
+	if err == nil {
+		tt, err := opentype.Parse(ttfBytes)
+		if err == nil {
+			g.fontSmall, err = opentype.NewFace(tt, &opentype.FaceOptions{
+				Size:    14,
+				DPI:     72,
+				Hinting: font.HintingFull,
+			})
+			if err != nil {
+				g.fontSmall = nil
+			}
+			g.fontBig, err = opentype.NewFace(tt, &opentype.FaceOptions{
+				Size:    36,
+				DPI:     72,
+				Hinting: font.HintingFull,
+			})
+			if err != nil {
+				g.fontBig = nil
+			}
+		}
+	}
+
+	// Initialiser l'audio
+	g.audioContext = audio.NewContext(44100) // fréquence 44.1 kHz
+
+	// Charger le MP3
+	mp3Data, err := os.ReadFile("menu/menu.mp3")
+	if err != nil {
+		log.Println("Impossible de charger la musique :", err)
+	} else {
+		d, err := mp3.Decode(g.audioContext, bytes.NewReader(mp3Data))
+		if err != nil {
+			log.Println("Erreur decode mp3 :", err)
+		} else {
+			g.bgmPlayer, err = audio.NewPlayer(g.audioContext, d)
+			if err != nil {
+				log.Println("Erreur création player :", err)
+			} else {
+				// On utilise la valeur du volume du jeu (0–100)
+				g.bgmPlayer.SetVolume(float64(g.volume) / 100.0)
+				g.bgmPlayer.Play() // lancer la musique
+			}
+		}
+	} // ✅ Ajout du marchand
+	g.Merchant = &Merchant{
+		X:      500,
+		Y:      750,
+		Items:  []string{"Cristaline", "Followers"},
+		Active: true,
+		Sprite: LoadImage("assets/marchand.png"),
+	}
+	g.MerchantZone = image.Rect(500, 700, 500+128, 750+128)
+	g.Followers = 0
+	g.Money = 100 // ton joueur commence avec 100 pièces
+	g.Inventaire = &Inventaire{
+		Items: []string{},
+	}
+	// Charger le background
+	img, _, err := ebitenutil.NewImageFromFile("assets/background.png")
+	if err != nil {
+		log.Fatal(err)
+	}
+	g.background = img
+
+	return g
+}
+
+// Marchand représente un vendeur avec quelques items
+type Merchant struct {
+	X, Y   float64
+	Items  []string
+	Active bool
+	Sprite *ebiten.Image
+}
+
+// Affiche le marchand (sprite PNG)
+func (m *Merchant) Draw(screen *ebiten.Image) {
+	if !m.Active || m.Sprite == nil {
+		return
+	}
+
+	op := &ebiten.DrawImageOptions{}
+	op.GeoM.Translate(m.X, m.Y)
+	screen.DrawImage(m.Sprite, op)
+}
+
+// -----------------
+// Ebiten methods
+// -----------------
+func (g *Game) Update() error {
+	UpdateNotifications()
+	// === Mise à jour de la zone du marchand pour coller au sprite ===
+	if g.Merchant != nil && g.Merchant.Sprite != nil {
+		w, h := g.Merchant.Sprite.Size() // largeur et hauteur du PNG du marchand
+		g.MerchantZone = image.Rect(
+			int(g.Merchant.X),
+			int(g.Merchant.Y),
+			int(g.Merchant.X)+w,
+			int(g.Merchant.Y)+h,
+		)
+	}
+
+	switch g.state {
+	case StateIntro:
+		g.updateIntro()
+	case StateMenu:
+		g.updateMenu()
+	case StateSettings:
+		g.updateSettings()
+	case StateSaveSelect:
+		g.updateSaveSelect()
+	case StateCreateSave:
+		g.updateCreateSave()
+	case StatePlaying:
+		g.updatePlaying()
+	case StateMerchantMenu:
+		g.updateMerchantMenu() // logique marchant uniquement dans Update
+	case StateBlacksmithMenu:
+		g.updateBlacksmithMenu()
+	}
+	return nil
+}
+
+func (g *Game) Draw(screen *ebiten.Image) {
+	switch g.state {
+	case StateIntro:
+		g.drawIntro(screen)
+
+	case StateMenu:
+		g.drawMenu(screen)
+
+	case StateSettings:
+		g.drawSettings(screen)
+
+	case StateSaveSelect:
+		g.drawSaveSelect(screen)
+
+	case StateCreateSave:
+		g.drawCreateSave(screen)
+
+	case StatePlaying:
+		if g.inBattle && g.battle != nil {
+			g.battle.Draw(screen)
+		} else {
+			// Dessiner la map / joueur / ennemis / marchand
+			if g.mapData != nil {
+				g.mapData.Draw(screen)
+			}
+			if g.player != nil {
+				g.player.Draw(screen)
+			}
+			for _, e := range g.enemies {
+				e.Draw(screen)
+			}
+			if g.Merchant != nil {
+				g.Merchant.Draw(screen)
+			}
+			if g.showBlacksmithMenu {
+				g.drawBlacksmithMenu(screen)
+				return // on évite de redessiner la map par-dessus
+			}
+			// Message "Appuie sur E pour lancer un combat !"
+			if g.player != nil {
+				playerRect := image.Rect(int(g.player.X), int(g.player.Y), int(g.player.X)+32, int(g.player.Y)+32)
+				if playerRect.Overlaps(g.combatZone) && !g.inBattle {
+					if g.fontSmall != nil {
+						text.Draw(screen, "Appuie sur E pour lancer un combat !", g.fontSmall, 200, 180, color.White)
+					} else {
+						ebitenutil.DebugPrintAt(screen, "Appuie sur E pour lancer un combat !", 200, 180)
+					}
+				}
+			}
+
+			// Message marchand au-dessus du marchand
+			if g.player != nil && g.Merchant != nil {
+				playerRect := image.Rect(int(g.player.X), int(g.player.Y), int(g.player.X)+32, int(g.player.Y)+32)
+				if g.MerchantZone.Overlaps(playerRect) {
+					if g.fontSmall != nil {
+						text.Draw(screen, "Appuie sur E pour parler au marchand", g.fontSmall, int(g.Merchant.X)-40, int(g.Merchant.Y)-20, color.White)
+					} else {
+						ebitenutil.DebugPrintAt(screen, "Appuie sur E pour parler au marchand", int(g.Merchant.X)-40, int(g.Merchant.Y)-20)
+					}
+				}
+			}
+
+			// Inventaire
+			if g.Inventaire != nil {
+				g.Inventaire.DrawNote(screen)
+				g.Inventaire.Draw(screen, g)
+			}
+		}
+
+		// -----------------
+		// HUD : argent / followers / classe (en dehors du bloc d'affichage de map)
+		// -----------------
+		hudX := 10
+		hudY := 60
+
+		opMoney := &ebiten.DrawImageOptions{}
+		opFollower := &ebiten.DrawImageOptions{}
+		opMoney.GeoM.Translate(float64(hudX), float64(hudY))
+		opFollower.GeoM.Translate(float64(hudX), float64(hudY+40))
+
+		if g.moneyIcon != nil {
+			screen.DrawImage(g.moneyIcon, opMoney)
+		}
+		if g.followerIcon != nil {
+			screen.DrawImage(g.followerIcon, opFollower)
+		}
+
+		if g.fontSmall != nil {
+			text.Draw(screen, fmt.Sprintf("%d", g.Money), g.fontSmall, hudX+40, hudY+25, color.White)
+			text.Draw(screen, fmt.Sprintf("%d", g.Followers), g.fontSmall, hudX+40, hudY+65, color.White)
+			if g.PlayerClass != "" {
+				text.Draw(screen, "Classe: "+g.PlayerClass, g.fontSmall, hudX, hudY+105, color.White)
+			}
+		} else {
+			ebitenutil.DebugPrintAt(screen, fmt.Sprintf("%d", g.Money), hudX+40, hudY+25)
+			ebitenutil.DebugPrintAt(screen, fmt.Sprintf("%d", g.Followers), hudX+40, hudY+65)
+			if g.PlayerClass != "" {
+				ebitenutil.DebugPrintAt(screen, "Classe: "+g.PlayerClass, hudX, hudY+105)
+			}
+		}
+
+	case StateMerchantMenu:
+		g.drawMerchantMenu(screen)
+	case StateBlacksmithMenu:
+		g.drawBlacksmithMenu(screen)
+	}
+
+	// Notifications (dessinées par-dessus tout)
+	if g.fontSmall != nil {
+		DrawNotifications(screen, g.fontSmall)
+	} else {
+		for i, n := range notifications {
+			ebitenutil.DebugPrintAt(screen, n.Text, 20, 40+i*30)
+		}
+	}
+}
+
+// -----------------
+// Draw Merchant Menu (affichage)
+// -----------------
+func (g *Game) drawMerchantMenu(screen *ebiten.Image) {
+	// --- Fond marchand ---
+	if g.merchantBg != nil {
+		op := &ebiten.DrawImageOptions{}
+		screen.DrawImage(g.merchantBg, op)
+	} else {
+		screen.Fill(color.RGBA{50, 30, 20, 255})
+	}
+
+	// --- Texte à l'intérieur du panneau ---
+	startX := 420 // un peu plus à gauche
+	startY := 400 // plus bas
+
+	if g.fontSmall != nil {
+		text.Draw(screen, "=== Marchand ===", g.fontSmall, startX, startY, color.White)
+		text.Draw(screen, "1. Cristalline - 50$", g.fontSmall, startX, startY+50, color.White)
+		text.Draw(screen, "2. Followers x100 - 200$", g.fontSmall, startX, startY+100, color.White)
+		text.Draw(screen, "Appuie sur ESC pour quitter", g.fontSmall, startX, startY+180, color.White)
+	} else {
+		ebitenutil.DebugPrintAt(screen, "=== Marchand ===", startX, startY)
+		ebitenutil.DebugPrintAt(screen, "1. Cristalline - 50$", startX, startY+50)
+		ebitenutil.DebugPrintAt(screen, "2. Followers x100 - 200$", startX, startY+100)
+		ebitenutil.DebugPrintAt(screen, "Appuie sur ESC pour quitter", startX, startY+180)
+	}
+}
+
+// -----------------
+// Update Merchant Menu (logique)
+// -----------------
+func (g *Game) updateMerchantMenu() {
+	// Ici on n'utilise que inpututil.IsKeyJustPressed : unique déclenchement par touche
+	if inpututil.IsKeyJustPressed(ebiten.Key1) {
+		if g.Money >= MerchantItems[0].Price {
+			g.Money -= MerchantItems[0].Price
+			MerchantItems[0].Action(g)
+			AddNotification("Tu as acheté : " + MerchantItems[0].Name)
+		} else {
+			AddNotification("Pas assez d'argent !")
+		}
+	}
+
+	if inpututil.IsKeyJustPressed(ebiten.Key2) {
+		if g.Money >= MerchantItems[1].Price {
+			g.Money -= MerchantItems[1].Price
+			MerchantItems[1].Action(g)
+			AddNotification("Tu as acheté : " + MerchantItems[1].Name)
+		} else {
+			AddNotification("Pas assez d'argent !")
+		}
+	}
+
+	if inpututil.IsKeyJustPressed(ebiten.KeyEscape) {
+		g.state = StatePlaying
+	}
+}
+
+// -----------------
+// Blacksmith Menu (draw + update)
+// -----------------
+func (g *Game) drawBlacksmithMenu(screen *ebiten.Image) {
+	if g.menuforgeron != nil {
+		op := &ebiten.DrawImageOptions{}
+		screen.DrawImage(g.menuforgeron, op)
+	} else {
+		screen.Fill(color.RGBA{40, 40, 40, 255})
+	}
+
+	face := g.fontSmall
+	if face == nil {
+		face = basicfont.Face7x13
+	}
+
+	options := []string{
+		"",
+		"Fusionner Cristalline + Téléphone -> Cristalline - big",
+	}
+
+	startX := 200
+	startY := 260
+	lineHeight := 80
+
+	for i, opt := range options {
+		y := startY + i*lineHeight
+		var col color.Color = color.White
+		if i == g.blacksmithSelected {
+			col = color.RGBA{255, 215, 0, 255} // gold selection
+		}
+		text.Draw(screen, opt, face, startX, y, col)
+	}
+
+	// aide / info en bas
+	if g.fontSmall != nil {
+		text.Draw(screen, "Appuie sur Entrée pour confirmer, ESC pour quitter", g.fontSmall, 200, startY+len(options)*lineHeight+20, color.RGBA{200, 200, 200, 255})
+	}
+}
+
+func (g *Game) updateBlacksmithMenu() {
+	inv := g.Inventaire
+	if inv == nil {
+		g.state = StatePlaying
+		return
+	}
+
+	// Navigation (0 = amélioration, 1 = fusion)
+	if inpututil.IsKeyJustPressed(ebiten.KeyUp) && g.blacksmithSelected > 0 {
+		g.blacksmithSelected--
+	}
+	if inpututil.IsKeyJustPressed(ebiten.KeyDown) && g.blacksmithSelected < 1 {
+		g.blacksmithSelected++
+	}
+
+	// Valider choix
+	if inpututil.IsKeyJustPressed(ebiten.KeyEnter) {
+		switch g.blacksmithSelected {
+		case 0:
+			// ----------------------
+			// Améliorer une Cristalline simple
+			// ----------------------
+			if inv.HasCristalline() && inv.RemoveCristalline() {
+				// transforme selon la classe du joueur
+				switch g.PlayerClass {
+				case "Lyricistes":
+					inv.AddItem("Cristalline - mystérieuse")
+				case "Performeurs":
+					inv.AddItem("Cristalline - tonic")
+				case "Hitmakers":
+					inv.AddItem("Cristalline - suspicieuse")
+				default:
+					inv.AddItem("Cristalline - mystérieuse")
+				}
+				AddNotification("🔨 Le forgeron a transformé ta Cristalline en version spéciale !")
+			} else {
+				AddNotification("❌ Il te faut une Cristalline simple pour améliorer.")
+			}
+
+		case 1:
+			// ----------------------
+			// Fusion Cristalline (spéciale ou simple) + Téléphone => BIG Cristalline
+			// ----------------------
+			if inv.HasCristalline() && inv.HasItem("Téléphone") {
+				// retire une cristalline (simple ou spéciale)
+				okCrist := inv.RemoveCristalline() ||
+					inv.RemoveItem("Cristalline - mystérieuse") ||
+					inv.RemoveItem("Cristalline - tonic") ||
+					inv.RemoveItem("Cristalline - suspicieuse")
+
+				// retire un téléphone
+				okTel := inv.RemoveItem("Téléphone")
+
+				if okCrist && okTel {
+					inv.AddItem("Cristalline - big")
+					AddNotification("💥 Fusion réussie ! Tu as créé une BIG Cristalline (+100 ego) !")
+				} else {
+					AddNotification("❌ Fusion échouée (objet manquant).")
+				}
+			} else {
+				AddNotification("❌ Il te faut une Cristalline et un Téléphone pour fusionner.")
+			}
+		}
+
+		// revenir au jeu après action
+		g.state = StatePlaying
+	}
+
+	// Quitter avec ESC
+	if inpututil.IsKeyJustPressed(ebiten.KeyEscape) {
+		g.state = StatePlaying
+	}
+}
+
+// -----------------
+// Intro update/draw
+// -----------------
+func (g *Game) updateIntro() {
+	g.introTimer++
+	if g.introTimer > 180 || IsKeyJustPressed(ebiten.KeyEnter) { // 3 secondes
+		g.state = StateMenu
+	}
+}
+
+func (g *Game) drawIntro(screen *ebiten.Image) {
+	screen.Fill(color.Black)
+	if g.fontBig != nil {
+		text.Draw(screen, g.introText, g.fontBig, 600, 400, color.White)
+	} else {
+		ebitenutil.DebugPrintAt(screen, g.introText, 600, 400)
+	}
+}
+
+// -----------------
+// Menu principal
+// -----------------
+func (g *Game) updateMenu() {
+	mx, my := ebiten.CursorPosition()
+	if ebiten.IsMouseButtonPressed(ebiten.MouseButtonLeft) {
+		for _, btn := range g.menuButtons {
+			if mx >= btn.Rect.Min.X && mx <= btn.Rect.Max.X &&
+				my >= btn.Rect.Min.Y && my <= btn.Rect.Max.Y {
+				if btn.Action != nil {
+					btn.Action()
+				}
+			}
+		}
+	}
+
+	if IsKeyJustPressed(ebiten.KeyUp) {
+		g.menuSelected--
+		if g.menuSelected < 0 {
+			g.menuSelected = len(g.menuButtons) - 1
+		}
+	}
+	if IsKeyJustPressed(ebiten.KeyDown) {
+		g.menuSelected++
+		if g.menuSelected >= len(g.menuButtons) {
+			g.menuSelected = 0
+		}
+	}
+	if IsKeyJustPressed(ebiten.KeyEnter) {
+		if g.menuButtons[g.menuSelected].Action != nil {
+			g.menuButtons[g.menuSelected].Action()
+		}
+	}
+}
+
+func (g *Game) drawMenu(screen *ebiten.Image) {
+	if g.menuBg != nil {
+		opts := &ebiten.DrawImageOptions{}
+		screen.DrawImage(g.menuBg, opts)
+	} else {
+		screen.Fill(color.RGBA{30, 30, 30, 255})
+	}
+
+	for i, btn := range g.menuButtons {
+		if i == g.menuSelected {
+			x := btn.Rect.Min.X - 40
+			y := (btn.Rect.Min.Y+btn.Rect.Max.Y)/2 + 10
+			if g.fontSmall != nil {
+				text.Draw(screen, "▶", g.fontSmall, x, y, color.RGBA{255, 255, 0, 255})
+			} else {
+				ebitenutil.DebugPrintAt(screen, ">", x, y)
+			}
+		}
+	}
+}
+
+// -----------------
+// Settings
+// -----------------
+func (g *Game) updateSettings() {
+	if IsKeyJustPressed(ebiten.KeyRight) || IsKeyJustPressed(ebiten.KeyUp) {
+		g.volume += 5
+		if g.volume > 100 {
+			g.volume = 100
+		}
+	}
+	if IsKeyJustPressed(ebiten.KeyLeft) || IsKeyJustPressed(ebiten.KeyDown) {
+		g.volume -= 5
+		if g.volume < 0 {
+			g.volume = 0
+		}
+	}
+
+	// ✅ appliquer immédiatement à la musique
+	if g.bgmPlayer != nil {
+		g.bgmPlayer.SetVolume(float64(g.volume) / 100.0)
+	}
+
+	if IsKeyJustPressed(ebiten.KeyEscape) {
+		g.state = StateMenu
+	}
+}
+
+func (g *Game) drawSettings(screen *ebiten.Image) {
+	if g.settingsBg != nil {
+		opts := &ebiten.DrawImageOptions{}
+		screen.DrawImage(g.settingsBg, opts)
+	} else {
+		screen.Fill(color.RGBA{0, 0, 0, 255})
+	}
+
+	w, h := screen.Size()
+	title := "SETTINGS"
+	vol := fmt.Sprintf("Volume: %d", g.volume)
+	info := "Press ESC to return"
+
+	if g.fontBig != nil {
+		text.Draw(screen, title, g.fontBig, w/2-(len(title)*18), h/2-100, color.White)
+		text.Draw(screen, vol, g.fontBig, w/2-(len(vol)*18), h/2, color.White)
+	} else {
+		ebitenutil.DebugPrintAt(screen, title, w/2-60, h/2-100)
+		ebitenutil.DebugPrintAt(screen, vol, w/2-60, h/2)
+	}
+	if g.fontSmall != nil {
+		text.Draw(screen, info, g.fontSmall, w/2-(len(info)*9), h/2+100, color.RGBA{200, 200, 200, 255})
+	} else {
+		ebitenutil.DebugPrintAt(screen, info, w/2-80, h/2+100)
+	}
+}
+
+// -----------------
+// Save selection
+// -----------------
+func (g *Game) openSaveSelect() {
+	saves, err := LoadAllSaves()
+	if err != nil {
+		saves = []Save{}
+	}
+	g.saves = saves
+	g.saveSelected = 0
+	g.pendingDelete = ""
+	g.state = StateSaveSelect
+}
+
+// Suppression avec confirmation et navigation dans la sélection de sauvegarde
+func (g *Game) updateSaveSelect() {
+	// Suppression avec confirmation
+	if g.saveSelected < len(g.saves) {
+		if IsKeyJustPressed(ebiten.KeyDelete) {
+			s := g.saves[g.saveSelected]
+			if g.pendingDelete == s.Name {
+				if err := DeleteSave(s.Name); err != nil {
+					fmt.Println("Erreur suppression save:", err)
+				} else {
+					all, _ := LoadAllSaves()
+					g.saves = all
+					if g.saveSelected >= len(g.saves) {
+						g.saveSelected = len(g.saves) - 1
+						if g.saveSelected < 0 {
+							g.saveSelected = 0
+						}
+					}
+				}
+				g.pendingDelete = ""
+			} else {
+				g.pendingDelete = s.Name
+			}
+		}
+	} else {
+		g.pendingDelete = ""
+	}
+
+	if IsKeyJustPressed(ebiten.KeyUp) {
+		g.saveSelected--
+		if g.saveSelected < 0 {
+			g.saveSelected = len(g.saves)
+		}
+	}
+	if IsKeyJustPressed(ebiten.KeyDown) {
+		g.saveSelected++
+		if g.saveSelected > len(g.saves) {
+			g.saveSelected = 0
+		}
+	}
+
+	if IsKeyJustPressed(ebiten.KeyEnter) {
+		if g.saveSelected == len(g.saves) {
+			g.newSaveName = ""
+			g.newSaveClass = ""
+			g.cursorTimer = 0
+			g.state = StateCreateSave
+		} else {
+			s := g.saves[g.saveSelected]
+			g.startGameFromSave(s)
+		}
+	}
+
+	if IsKeyJustPressed(ebiten.KeyEscape) {
+		g.state = StateMenu
+	}
+}
+
+func (g *Game) drawSaveSelect(screen *ebiten.Image) {
+	// --- Fond avec image ---
+	if g.SelectSaveBackground != nil { // 👉 variable à charger au démarrage du jeu
+		op := &ebiten.DrawImageOptions{}
+		screen.DrawImage(g.SelectSaveBackground, op)
+	} else {
+		// fallback couleur si l'image n'est pas dispo
+		screen.Fill(color.RGBA{20, 20, 60, 255})
+	}
+
+	// --- Titre ---
+	title := "Sélectionne une sauvegarde :"
+	if g.fontBig != nil {
+		text.Draw(screen, title, g.fontBig, 600, 200, color.White)
+	} else {
+		ebitenutil.DebugPrintAt(screen, title, 600, 200)
+	}
+
+	for i, s := range g.saves {
+		line := fmt.Sprintf("%s (%s)", s.Name, s.Class)
+		if i == g.saveSelected {
+			if g.pendingDelete == s.Name {
+				line = "> " + line + "   (Appuie encore sur Suppr pour CONFIRMER)"
+			} else {
+				line = "> " + line + "   (Suppr = supprimer)"
+			}
+		}
+		if g.fontSmall != nil {
+			text.Draw(screen, line, g.fontSmall, 600, 260+i*40, color.White)
+		} else {
+			ebitenutil.DebugPrintAt(screen, line, 600, 260+i*20)
+		}
+	}
+
+	newSaveText := "Créer une nouvelle sauvegarde"
+	if g.saveSelected == len(g.saves) {
+		newSaveText = "> " + newSaveText
+	}
+	if g.fontSmall != nil {
+		text.Draw(screen, newSaveText, g.fontSmall, 600, 260+len(g.saves)*40, color.White)
+		text.Draw(screen, "Appuie sur ESC pour revenir", g.fontSmall, 600, 700, color.RGBA{200, 200, 200, 255})
+	} else {
+		ebitenutil.DebugPrintAt(screen, newSaveText, 600, 260+len(g.saves)*20)
+		ebitenutil.DebugPrintAt(screen, "Appuie sur ESC pour revenir", 600, 700)
+	}
+}
+
+// -----------------
+// Create Save
+// -----------------
+func (g *Game) updateCreateSave() {
+	for _, r := range ebiten.InputChars() {
+		if r == '\n' || r == '\r' {
+			continue
+		}
+		g.newSaveName += string(r)
+	}
+	if IsKeyJustPressed(ebiten.KeyBackspace) && len(g.newSaveName) > 0 {
+		g.newSaveName = g.newSaveName[:len(g.newSaveName)-1]
+	}
+
+	if IsKeyJustPressed(ebiten.Key1) {
+		g.newSaveClass = "Lyricistes"
+	}
+	if IsKeyJustPressed(ebiten.Key2) {
+		g.newSaveClass = "Performeurs"
+	}
+	if IsKeyJustPressed(ebiten.Key3) {
+		g.newSaveClass = "Hitmakers"
+	}
+
+	if IsKeyJustPressed(ebiten.KeyEnter) && g.newSaveClass != "" {
+		name := g.newSaveName
+		if name == "" {
+			name = fmt.Sprintf("Player-%d", len(g.saves)+1)
+		}
+		s, err := CreateSave(name, g.newSaveClass)
+		if err != nil {
+			fmt.Println("Erreur création save:", err)
+		} else {
+			all, _ := LoadAllSaves()
+			g.saves = all
+			g.startGameFromSave(s)
+		}
+	}
+
+	if IsKeyJustPressed(ebiten.KeyEscape) {
+		g.state = StateSaveSelect
+	}
+
+	g.cursorTimer++
+}
+
+func (g *Game) drawCreateSave(screen *ebiten.Image) {
+	// --- Fond avec image ---
+	if g.background != nil {
+		op := &ebiten.DrawImageOptions{}
+		screen.DrawImage(g.background, op)
+	} else {
+		// fallback si l'image n'est pas dispo
+		screen.Fill(color.RGBA{10, 10, 40, 255})
+	}
+
+	// --- Titre ---
+	title := "Création d'une nouvelle sauvegarde"
+	if g.fontBig != nil {
+		text.Draw(screen, title, g.fontBig, 600, 200, color.White)
+	} else {
+		ebitenutil.DebugPrintAt(screen, title, 600, 200)
+	}
+
+	// --- Nom du personnage ---
+	prompt := "Nom du personnage :"
+	if g.fontSmall != nil {
+		text.Draw(screen, prompt, g.fontSmall, 600, 260, color.White)
+	} else {
+		ebitenutil.DebugPrintAt(screen, prompt, 600, 260)
+	}
+
+	// Curseur clignotant
+	cursor := "_"
+	if (g.cursorTimer/30)%2 == 0 {
+		cursor = " "
+	}
+	if g.fontSmall != nil {
+		text.Draw(screen, g.newSaveName+cursor, g.fontSmall, 600, 300, color.White)
+	} else {
+		ebitenutil.DebugPrintAt(screen, g.newSaveName+cursor, 600, 300)
+	}
+
+	// --- Choix de la classe ---
+	if g.fontSmall != nil {
+		text.Draw(screen, "Choisis une classe :", g.fontSmall, 600, 360, color.White)
+		text.Draw(screen, "[1] Lyricistes", g.fontSmall, 600, 400, color.White)
+		text.Draw(screen, "[2] Performeurs", g.fontSmall, 600, 440, color.White)
+		text.Draw(screen, "[3] Hitmakers", g.fontSmall, 600, 480, color.White)
+	} else {
+		ebitenutil.DebugPrintAt(screen, "Choisis une classe :", 600, 360)
+		ebitenutil.DebugPrintAt(screen, "[1] Lyricistes", 600, 400)
+		ebitenutil.DebugPrintAt(screen, "[2] Performeurs", 600, 440)
+		ebitenutil.DebugPrintAt(screen, "[3] Hitmakers", 600, 480)
+	}
+
+	// --- Classe choisie ---
+	if g.newSaveClass != "" {
+		if g.fontSmall != nil {
+			text.Draw(screen, "Classe choisie: "+g.newSaveClass, g.fontSmall, 600, 540, color.White)
+			text.Draw(screen, "Appuie sur Entrée pour valider", g.fontSmall, 600, 580, color.White)
+		} else {
+			ebitenutil.DebugPrintAt(screen, "Classe choisie: "+g.newSaveClass, 600, 540)
+		}
+	}
+
+	// --- Retour ---
+	if g.fontSmall != nil {
+		text.Draw(screen, "Appuie sur ECHAP pour annuler", g.fontSmall, 600, 640, color.White)
+	} else {
+		ebitenutil.DebugPrintAt(screen, "Appuie sur ECHAP pour annuler", 600, 640)
+	}
+}
+
+// -----------------
+// Start game from save
+// -----------------
+func (g *Game) startGameFromSave(s Save) {
+	g.player = NewPlayer(s.PlayerX, s.PlayerY, s.Class)
+	g.player.Ego = s.Ego
+	g.player.Flow = s.Flow
+	g.player.Charisma = s.Charisma
+	g.Inventaire = NewInventaireFromItems(s.Inventory)
+
+	g.PlayerClass = s.Class
+
+	g.mapData = NewMap()
+
+	// Création des ennemis
+	enemyTop := NewEnemy(600, 100, "Rival Rapper")
+
+	g.enemies = []*Enemy{
+		enemyTop,
+	}
+
+	g.inBattle = false
+
+	// Récupérer la taille du sprite pour caler la zone de combat
+	w, h := enemyTop.sprite.Size()
+	g.combatZone = image.Rect(
+		int(enemyTop.X),
+		int(enemyTop.Y),
+		int(enemyTop.X)+w,
+		int(enemyTop.Y)+h,
+	)
+
+	g.state = StatePlaying
+}
+
+// -----------------
+// Playing update
+// -----------------
+func (g *Game) updatePlaying() {
+	// Player update (sans param — ta Player.Update n'attend pas mapData)
+	if g.player != nil {
+		g.player.Update()
+	}
+
+	// Ouvrir/fermer inventaire avec TAB
+	if IsKeyJustPressed(ebiten.KeyTab) && g.Inventaire != nil {
+		g.Inventaire.Open = !g.Inventaire.Open
+	}
+	// 👉 Ici, on ouvre le menu du forgeron avec F
+	if IsKeyJustPressed(ebiten.KeyF) {
+		g.state = StateBlacksmithMenu
+		g.blacksmithSelected = 0
+		return
+	}
+
+	// Si inventaire ouvert → navigation + actions
+	if g.Inventaire != nil && g.Inventaire.Open {
+		// navigation Up/Down
+		if IsKeyJustPressed(ebiten.KeyUp) {
+			g.Inventaire.selected--
+			if g.Inventaire.selected < 0 && len(g.Inventaire.Items) > 0 {
+				g.Inventaire.selected = len(g.Inventaire.Items) - 1
+			}
+		}
+		if IsKeyJustPressed(ebiten.KeyDown) {
+			g.Inventaire.selected++
+			if g.Inventaire.selected >= len(g.Inventaire.Items) && len(g.Inventaire.Items) > 0 {
+				g.Inventaire.selected = 0
+			}
+		}
+
+		// Consommation : Enter
+		if IsKeyJustPressed(ebiten.KeyEnter) && len(g.Inventaire.Items) > 0 {
+			idx := g.Inventaire.selected
+			if idx >= 0 && idx < len(g.Inventaire.Items) {
+				item := g.Inventaire.Items[idx]
+
+				switch item {
+				// Cristalline
+				case "Cristalline - mystérieuse", "Cristalline - tonic", "Cristalline - suspicieuse":
+					if g.player != nil {
+						g.player.BonusEgo += 50
+						AddNotification(fmt.Sprintf("%s consommée : +50 Ego au prochain combat", item))
+					}
+
+				// Micro
+				case "Micro":
+					if g.player != nil {
+						g.player.BonusEgo += 10
+						AddNotification(" Micro utilisé : +10 Ego pour le prochain combat")
+					}
+
+				// Cigarette électronique
+				case "Cigarette électronique":
+					if g.player != nil {
+						g.player.PendingEnemyEgoDebuff += 15
+						AddNotification(" Cigarette électronique utilisée : l'ennemi perd 15 Ego au prochain combat")
+					}
+					// Micro
+				case "Cristalline - big":
+					if g.player != nil {
+						g.player.BonusEgo += 100
+						AddNotification(" Cristalline - big utilisé : +100 Ego pour le prochain combat")
+					}
+
+				// Autres objets
+				default:
+					AddNotification("Tu as choisi : " + item)
+				}
+
+				// 🔥 Suppression de l’objet consommé (commun à tous les cas)
+				g.Inventaire.Items = append(g.Inventaire.Items[:idx], g.Inventaire.Items[idx+1:]...)
+				if g.Inventaire.Icons != nil {
+					delete(g.Inventaire.Icons, item)
+				}
+				if idx >= len(g.Inventaire.Items) {
+					g.Inventaire.selected = len(g.Inventaire.Items) - 1
+				}
+				if g.Inventaire.selected < 0 {
+					g.Inventaire.selected = 0
+				}
+			}
+		}
+	}
+
+	// Détection entrée zone marchand + E pour ouvrir le menu
+	if g.player != nil {
+		playerRect := image.Rect(
+			int(g.player.X), int(g.player.Y),
+			int(g.player.X)+32, int(g.player.Y)+32, // adapte à la taille du sprite joueur
+		)
+
+		if g.MerchantZone.Overlaps(playerRect) {
+			// Si touche E pressée → ouvre le menu du marchand
+			if IsKeyJustPressed(ebiten.KeyE) {
+				g.state = StateMerchantMenu
+			}
+		}
+	}
+
+	// Détection entrée zone combat + E pour lancer combat
+	if g.player != nil && g.combatZone.Overlaps(image.Rect(int(g.player.X), int(g.player.Y), int(g.player.X)+32, int(g.player.Y)+32)) && !g.inBattle {
+		if IsKeyJustPressed(ebiten.KeyE) {
+			g.inBattle = true
+			if len(g.enemies) > 0 {
+				// On passe BonusEgo à NewBattle via g.player
+				g.battle = NewBattle(g.player, g.enemies[0])
+			}
+		}
+	}
+
+	// Si en bataille → update combat
+	if g.inBattle && g.battle != nil {
+		g.battle.Update()
+		if g.battle.IsOver() {
+			// 👉 Vérifie si le joueur a gagné
+			if g.battle.Winner == "player" {
+				g.Money += 50
+				g.Followers += 100
+				AddNotification("Victoire ! +50$ et +100 followers ")
+			} else if g.battle.Winner == "enemy" {
+				AddNotification("Défaite... ")
+			}
+
+			// Reset état après combat
+			g.inBattle = false
+			g.battle = nil
+			g.player.BonusEgo = 0 // le bonus ne s’applique qu’une fois
+		}
+	}
+}
+
+// -----------------
+// Layout (obligatoire pour Ebiten)
+// -----------------
+func (g *Game) Layout(outsideWidth, outsideHeight int) (int, int) {
+	return 1920, 1080 // taille interne du rendu
+}
