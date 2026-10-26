@@ -48,7 +48,7 @@ go build -o bin/rap-legacy.exe .
 
 Conserver le terminal dans la racine : le programme charge les images et la musique par des chemins relatifs. Copier uniquement l'exécutable ailleurs ne suffit pas pour lancer le jeu.
 
-Sous Linux/macOS : créer le dossier bin avec `mkdir -p bin`, compiler avec `go build -o bin/rap-legacy .`, puis exécuter `./bin/rap-legacy`. Un environnement graphique et les dépendances système adaptées à Ebitengine 2.8.8 peuvent être nécessaires ; la compilation vérifiée pour ce dépôt a été effectuée sous Windows.
+Sous Linux/macOS : créer le dossier bin avec `mkdir -p bin`, compiler avec `go build -o bin/rap-legacy .`, puis exécuter `./bin/rap-legacy`. Un environnement graphique et les dépendances système adaptées à Ebitengine 2.8.8 peuvent être nécessaires.
 
 ## Première partie et commandes
 
@@ -67,8 +67,6 @@ Sous Linux/macOS : créer le dossier bin avec `mkdir -p bin`, compiler avec `go 
 | Forgeron / craft | F ouvrir, haut/bas et Entrée, Échap revenir |
 | Création de partie | Saisie du nom, Retour arrière, 1 Lyricistes / 2 Performeurs / 3 Hitmakers et Entrée |
 | Suppression d'une partie | Dans l'écran des sauvegardes, Suppr sélectionne la suppression ; une seconde pression confirme |
-
-Ces contrôles sont documentés d'après les sources ; le parcours graphique complet n'a pas été rejoué pendant l'import.
 
 ## Sauvegarder, arrêter et restaurer une partie
 
@@ -105,8 +103,8 @@ Changer une fonctionnalité à la fois dans les fichiers concernés, compiler av
 
 Projet réalisé en binôme : contribution d'Arwy07 aux sauvegardes, à l'inventaire, au marchand et au craft ; contribution du second développeur aux visuels, menus, combats et à la musique. Les potions et l'intégration générale ont été réalisées ensemble, selon le README du projet d'origine.
 
-Sources récupérées depuis le dossier local du projet ; ancien historique Git, exécutable et sauvegardes personnelles exclus. Le chemin de la musique du menu a été corrigé pour fonctionner depuis la racine. Aucune licence supplémentaire n'est attribuée aux ressources : leur provenance et leurs droits doivent être confirmés avant redistribution publique.
+Le chemin de la musique du menu a été corrigé pour fonctionner depuis la racine. Aucune licence supplémentaire n'est attribuée aux ressources : leur provenance et leurs droits doivent être confirmés avant redistribution publique.
 
-## État et limites
+## À propos
 
-Prototype pédagogique conservé pour présenter le travail réalisé. La compilation et les vérifications effectuées sont consignées dans [VALIDATION.md](VALIDATION.md). Une compilation réussie ne remplace pas une vérification des interactions en jeu.
+Prototype pédagogique réalisé en binôme en une semaine. Les sources et ressources nécessaires sont incluses ; les sauvegardes restent locales. Le chemin de la musique est prévu pour un lancement depuis la racine du projet.
